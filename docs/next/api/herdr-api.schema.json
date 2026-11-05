@@ -2997,6 +2997,41 @@
           ],
           "type": "object"
         },
+        "PaneReportAgentSessionVerifiedParams": {
+          "description": "Negotiated process-verified Pi session report. Legacy methods remain unchanged.",
+          "properties": {
+            "agent_session_path": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "reporter_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_start_source": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id",
+            "reporter_pid",
+            "agent_session_path",
+            "seq"
+          ],
+          "type": "object"
+        },
         "PaneReportMetadataParams": {
           "properties": {
             "agent": {
@@ -6305,6 +6340,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.report_agent_session_verified",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportAgentSessionVerifiedParams"
             }
           },
           "required": [
@@ -10439,6 +10490,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "reporter_pid_session": {
+              "default": false,
+              "description": "Supports negotiated reporter-PID Pi session reports.",
               "type": "boolean"
             },
             "ssh_agent_registration": {
