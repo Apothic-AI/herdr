@@ -1889,6 +1889,7 @@ impl TerminalState {
             self.forget_reported_resume_of(&authority.source, &authority.agent_label);
         }
         self.persisted_agent_session = None;
+        self.verified_pi_reporter = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -6105,6 +6106,65 @@ mod tests {
 
         assert!(mutation.session_ref_changed);
         assert!(terminal.hook_authority.is_none());
+    }
+
+    #[test]
+    fn clearing_verified_pi_authority_prevents_exit_based_replacement() {
+        use crate::platform::pi_reporter::PiReporterIdentity;
+        let mut terminal = test_terminal();
+        let old = crate::agent_resume::AgentSessionRef::path(test_session_path("clear-old.jsonl"))
+            .unwrap();
+        let new = crate::agent_resume::AgentSessionRef::path(test_session_path("clear-new.jsonl"))
+            .unwrap();
+        let old_identity = PiReporterIdentity {
+            pid: 20,
+            start_token: 1,
+        };
+        let new_identity = PiReporterIdentity {
+            pid: 30,
+            start_token: 2,
+        };
+        assert!(terminal
+            .report_verified_pi_session(
+                old_identity,
+                false,
+                old.clone(),
+                10,
+                Some("startup".into())
+            )
+            .is_some());
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(old.clone()),
+                Some(11)
+            )
+            .is_some());
+
+        assert!(terminal
+            .clear_hook_authority_with_mutation(Some("herdr:pi"), Some(12))
+            .is_some());
+        assert_eq!(terminal.verified_pi_reporter(), None);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+        assert_eq!(terminal.verified_pi_reporter(), None);
+
+        assert!(terminal
+            .report_verified_pi_session(new_identity, true, new.clone(), 1, Some("startup".into()))
+            .is_none());
+        assert_eq!(terminal.verified_pi_reporter(), None);
+        assert!(!terminal.session_ref_is_current(&old));
+        assert!(!terminal.session_ref_is_current(&new));
     }
 
     #[test]
