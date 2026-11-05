@@ -194,6 +194,7 @@ mod tests {
             "pane.rename",
             "pane.report_agent",
             "pane.report_agent_session",
+            "pane.report_agent_session_verified",
             "pane.report_metadata",
             "pane.clear_agent_authority",
             "pane.release_agent",

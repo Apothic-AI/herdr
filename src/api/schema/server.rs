@@ -55,4 +55,7 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Supports negotiated reporter-PID Pi session reports.
+    #[serde(default)]
+    pub reporter_pid_session: bool,
 }

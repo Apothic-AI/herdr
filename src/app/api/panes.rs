@@ -1596,6 +1596,60 @@ impl App {
         )
     }
 
+    pub(super) fn handle_pane_report_agent_session_verified(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneReportAgentSessionVerifiedParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let identity = self
+            .lookup_runtime(ws_idx, pane_id)
+            .and_then(|(runtime, _)| runtime.child_pid())
+            .and_then(|shell| crate::platform::pi_reporter::verify(shell, params.reporter_pid));
+        let Some(identity) = identity else {
+            return encode_error(
+                id,
+                "reporter_not_verified",
+                "reporter is not the exact foreground Pi owner",
+            );
+        };
+        let Some(session_ref) =
+            crate::agent_resume::AgentSessionRef::path(params.agent_session_path)
+        else {
+            return encode_error(
+                id,
+                "invalid_session_path",
+                "expected an absolute session path",
+            );
+        };
+        let newer = self
+            .pane_terminal(ws_idx, pane_id)
+            .is_some_and(|terminal| terminal.hook_report_is_newer("herdr:pi", Some(params.seq)));
+        let previous_generation_gone = self
+            .pane_terminal(ws_idx, pane_id)
+            .and_then(|terminal| terminal.verified_pi_reporter())
+            .is_some_and(crate::platform::pi_reporter::confirmed_gone);
+        self.handle_internal_event(crate::events::AppEvent::VerifiedPiSessionReported {
+            pane_id,
+            identity,
+            previous_generation_gone,
+            session_ref: session_ref.clone(),
+            seq: params.seq,
+            reason: params.session_start_source,
+        });
+        if newer && self.session_report_applied(ws_idx, pane_id, Some(&session_ref)) {
+            encode_success(id, ResponseResult::Ok {})
+        } else {
+            encode_error(
+                id,
+                "session_not_accepted",
+                "session replacement was not applied",
+            )
+        }
+    }
+
     pub(super) fn handle_pane_report_agent_session(
         &mut self,
         id: String,

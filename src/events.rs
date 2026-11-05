@@ -120,6 +120,15 @@ pub enum AppEvent {
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         session_start_source: Option<String>,
     },
+    /// Process evidence verified by the runtime, never accepted from a client codec.
+    VerifiedPiSessionReported {
+        pane_id: PaneId,
+        identity: crate::platform::pi_reporter::PiReporterIdentity,
+        previous_generation_gone: bool,
+        session_ref: crate::agent_resume::AgentSessionRef,
+        seq: u64,
+        reason: Option<String>,
+    },
     /// A reporter supplied the command that resumes its own session.
     AgentResumeReported {
         pane_id: PaneId,
