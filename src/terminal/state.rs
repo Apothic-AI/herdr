@@ -563,7 +563,6 @@ impl TerminalState {
                     })
             {
                 self.persisted_agent_session = None;
-                self.verified_pi_reporter = None;
             }
             if !newer_custom_authority
                 && agent.is_some()
@@ -1469,13 +1468,18 @@ impl TerminalState {
     pub(crate) fn verified_pi_reporter(
         &self,
     ) -> Option<crate::platform::pi_reporter::PiReporterIdentity> {
-        let (identity, session) = self.verified_pi_reporter.as_ref()?;
-        let current = self.current_session_identity_for_persistence()?;
-        (current.0 == "herdr:pi"
-            && current.1 == "pi"
-            && current.2 == session.kind
-            && current.3 == session.value)
-            .then_some(*identity)
+        let (identity, verified_session) = self.verified_pi_reporter.as_ref()?;
+        match self.current_session_identity_for_persistence() {
+            Some((source, agent, kind, value)) => (source == "herdr:pi"
+                && agent == "pi"
+                && kind == verified_session.kind
+                && value == verified_session.value)
+                .then_some(*identity),
+            None => self
+                .recent_agent_process_exit
+                .is_some_and(|exit| exit.agent == Agent::Pi)
+                .then_some(*identity),
+        }
     }
 
     pub(crate) fn report_verified_pi_session(
@@ -1495,6 +1499,8 @@ impl TerminalState {
         // replacement whose predecessor is confirmed gone can reset ordering.
         if replacement {
             self.hook_report_sequences.remove("herdr:pi");
+            self.suppressed_full_lifecycle_hook_reports
+                .remove("herdr:pi");
         }
         if !self.hook_report_is_newer("herdr:pi", Some(seq)) {
             return None;
@@ -1611,6 +1617,7 @@ impl TerminalState {
         }
         if full_lifecycle_source
             && !selection_can_reconcile
+            && !verified_startup_replacement
             && (!process_present || generation_gated || !session_anchored)
         {
             if !Self::session_start_source_is_recognized(session_start_source.as_deref()) {
@@ -3194,6 +3201,74 @@ mod tests {
         assert!(result.is_some());
         assert!(terminal.session_ref_is_current(&new));
         assert_eq!(terminal.hook_report_sequences.get("herdr:pi"), Some(&1));
+    }
+
+    #[test]
+    fn verified_pi_lifecycle_records_first_report_and_rebinds_after_exit() {
+        use crate::platform::pi_reporter::PiReporterIdentity;
+        let mut terminal = test_terminal();
+        let old =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("lifecycle-old.jsonl"))
+                .unwrap();
+        let new =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("lifecycle-new.jsonl"))
+                .unwrap();
+        let old_identity = PiReporterIdentity {
+            pid: 20,
+            start_token: 1,
+        };
+        let new_identity = PiReporterIdentity {
+            pid: 30,
+            start_token: 2,
+        };
+        assert_eq!(terminal.detected_agent, None);
+        assert!(terminal
+            .report_verified_pi_session(
+                old_identity,
+                false,
+                old.clone(),
+                10,
+                Some("startup".into())
+            )
+            .is_some());
+        assert_eq!(terminal.verified_pi_reporter(), Some(old_identity));
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Idle,
+                None,
+                Some(old),
+                Some(11)
+            )
+            .is_some());
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(terminal.verified_pi_reporter(), Some(old_identity));
+        assert!(terminal
+            .report_verified_pi_session(new_identity, true, new.clone(), 1, Some("startup".into()))
+            .is_some());
+        assert_eq!(terminal.verified_pi_reporter(), Some(new_identity));
+        assert!(terminal.session_ref_is_current(&new));
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(new),
+                Some(2)
+            )
+            .is_some());
+        assert_eq!(terminal.state, AgentState::Working);
     }
 
     #[test]

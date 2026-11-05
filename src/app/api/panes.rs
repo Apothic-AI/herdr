@@ -1624,9 +1624,6 @@ impl App {
                 "expected an absolute session path",
             );
         };
-        let newer = self
-            .pane_terminal(ws_idx, pane_id)
-            .is_some_and(|terminal| terminal.hook_report_is_newer("herdr:pi", Some(params.seq)));
         let previous_generation_gone = self
             .pane_terminal(ws_idx, pane_id)
             .and_then(|terminal| terminal.verified_pi_reporter())
@@ -1639,7 +1636,11 @@ impl App {
             seq: params.seq,
             reason: params.session_start_source,
         });
-        if newer && self.session_report_applied(ws_idx, pane_id, Some(&session_ref)) {
+        let applied = self.session_report_applied(ws_idx, pane_id, Some(&session_ref))
+            && self
+                .pane_terminal(ws_idx, pane_id)
+                .is_some_and(|terminal| terminal.session_ref_is_current(&session_ref));
+        if applied {
             encode_success(id, ResponseResult::Ok {})
         } else {
             encode_error(
