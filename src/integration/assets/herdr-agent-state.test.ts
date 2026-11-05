@@ -104,7 +104,7 @@ function captureConnectionEndpoint() {
   return () => connectedEndpoint;
 }
 
-async function startRecordingServer(name: string): Promise<unknown[]> {
+async function startRecordingServer(name: string, reporterPidSession = false): Promise<unknown[]> {
   const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
   socketPath = recordingSocketPath;
   await rm(recordingSocketPath, { force: true });
@@ -119,8 +119,12 @@ async function startRecordingServer(name: string): Promise<unknown[]> {
       if (newline === -1) {
         return;
       }
-      requests.push(JSON.parse(input.slice(0, newline)));
-      socket.end("{}\n");
+      const request = JSON.parse(input.slice(0, newline));
+      requests.push(request);
+      const result = isRecord(request) && request.method === "ping"
+        ? { type: "pong", capabilities: { reporter_pid_session: reporterPidSession } }
+        : {};
+      socket.end(`${JSON.stringify({ id: isRecord(request) ? request.id : "test", result })}\n`);
     });
   });
   server = recordingServer;
@@ -273,6 +277,24 @@ test("OMP accepts POSIX and Windows session paths", async () => {
   expect(isAbsoluteSessionPath("relative/omp-session.jsonl")).toBe(false);
 });
 
+test("Pi negotiates reporter PID reports only when advertised", async () => {
+  const requests = await startRecordingServer("pi-verified-session", true);
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+  await handlers.get("session_start")?.(
+    { reason: "startup" },
+    {
+      ...piContext(() => true),
+      sessionManager: { getSessionFile: () => "/tmp/pi-verified.jsonl", getSessionId: () => "pi-verified" },
+    },
+  );
+  await waitFor(() => requestStates(requests).length === 1);
+  const verified = requests.find((request) => isRecord(request) && request.method === "pane.report_agent_session_verified");
+  expect(isRecord(verified) && isRecord(verified.params) ? verified.params.reporter_pid : undefined).toBe(process.pid);
+  expect(requests.some((request) => isRecord(request) && request.method === "pane.report_agent_session")).toBe(false);
+});
+
 test("Pi reports a Windows session path", async () => {
   const requests = await startRecordingServer("pi-windows-session-path");
   const { handlers, pi } = createExtensionHarness();
@@ -290,9 +312,9 @@ test("Pi reports a Windows session path", async () => {
       },
     },
   );
-  await waitFor(() => requests.length === 2);
+  await waitFor(() => requests.filter((request) => requestSessionPath(request) !== undefined).length === 2);
 
-  expect(requests.map(requestSessionPath)).toEqual([sessionPath, sessionPath]);
+  expect(requests.filter((request) => requestSessionPath(request) !== undefined).map(requestSessionPath)).toEqual([sessionPath, sessionPath]);
 });
 
 test("Pi reports idle only after the agent settles", async () => {
@@ -476,6 +498,7 @@ test("Pi waits for a replacement session report before publishing state", async 
     await Bun.sleep(5);
   }
   expect(requests.map((request) => (isRecord(request) ? request.method : undefined))).toEqual([
+    "ping",
     "pane.report_agent_session",
     "pane.report_agent",
   ]);

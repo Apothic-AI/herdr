@@ -111,12 +111,55 @@ function currentSessionRef(): Record<string, unknown> | undefined {
   return undefined;
 }
 
-function reportSession(sessionStartSource?: string): Promise<void> {
+let verifiedReports: boolean | undefined;
+
+async function requestValue(method: string, params: Record<string, unknown>): Promise<any> {
+  if (!enabled()) return undefined;
+  return new Promise((resolve) => {
+    let input = "";
+    let done = false;
+    const socket = net.createConnection(socketEndpoint!);
+    const finish = (value: unknown) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(undefined), 500);
+    socket.on("connect", () => socket.write(`${JSON.stringify({ id: `${source}:verify:${nextReportSeq()}`, method, params })}\n`));
+    socket.on("data", (chunk) => {
+      input += chunk.toString();
+      const newline = input.indexOf("\n");
+      if (newline < 0) return;
+      try { finish(JSON.parse(input.slice(0, newline))); } catch { finish(undefined); }
+    });
+    socket.on("error", () => finish(undefined));
+    socket.on("end", () => finish(undefined));
+  });
+}
+
+async function reportSession(sessionStartSource?: string): Promise<void> {
   const sessionRef = currentSessionRef();
   if (!sessionRef) {
     return Promise.resolve();
   }
 
+  if (verifiedReports === undefined) {
+    const pong = await requestValue("ping", {});
+    verifiedReports = pong?.result?.capabilities?.reporter_pid_session === true;
+  }
+  if (verifiedReports && currentAgentSessionPath) {
+    // A negotiated rejection never falls back to an unverified replacement.
+    await requestValue("pane.report_agent_session_verified", {
+      pane_id: paneId,
+      reporter_pid: process.pid,
+      agent_session_path: currentAgentSessionPath,
+      seq: nextReportSeq(),
+      session_start_source: sessionStartSource,
+    });
+    return;
+  }
   return sendRequest({
     id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent_session",

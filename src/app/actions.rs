@@ -1518,6 +1518,25 @@ impl AppState {
                     .collect()
                 }
             }
+            AppEvent::VerifiedPiSessionReported {
+                pane_id,
+                identity,
+                previous_generation_gone,
+                session_ref,
+                seq,
+                reason,
+            } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    terminal.report_verified_pi_session(
+                        identity,
+                        previous_generation_gone,
+                        session_ref,
+                        seq,
+                        reason,
+                    )
+                })
+                .into_iter()
+                .collect(),
             AppEvent::AgentResumeReported {
                 pane_id,
                 source,

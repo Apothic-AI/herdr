@@ -75,6 +75,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        reporter_pid_session: cfg!(target_os = "linux"),
     })
 }
 
@@ -1397,6 +1398,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                reporter_pid_session: false,
             }),
             None,
             None,

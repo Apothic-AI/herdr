@@ -714,6 +714,17 @@ fn agent_status_request_values_remain_strict() {
 }
 
 #[test]
+fn reporter_pid_negotiation_preserves_legacy_defaults() {
+    let capabilities: ServerCapabilities =
+        serde_json::from_str(r#"{"live_handoff":false}"#).unwrap();
+    assert!(!capabilities.reporter_pid_session);
+    let legacy: Request = serde_json::from_str(r#"{"id":"legacy","method":"pane.report_agent_session","params":{"pane_id":"w1:p1","source":"herdr:pi","agent":"pi"}}"#).unwrap();
+    assert!(matches!(legacy.method, Method::PaneReportAgentSession(_)));
+    let missing_pid = r#"{"id":"new","method":"pane.report_agent_session_verified","params":{"pane_id":"w1:p1","agent_session_path":"/tmp/session.jsonl","seq":1}}"#;
+    assert!(serde_json::from_str::<Request>(missing_pid).is_err());
+}
+
+#[test]
 fn success_response_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
@@ -727,6 +738,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                reporter_pid_session: false,
             }),
         },
     };

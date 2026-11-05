@@ -726,6 +726,31 @@ pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
     (result == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
+pub(crate) fn verify_pi_reporter(
+    shell_pid: u32,
+    reporter_pid: u32,
+) -> Option<super::pi_reporter::PiReporterIdentity> {
+    let before = process_start_token(reporter_pid)?;
+    let job = foreground_job(shell_pid)?;
+    let parent = process_name_and_parent(reporter_pid)?.1;
+    if !super::pi_reporter::owns_job(&job, reporter_pid, parent) {
+        return None;
+    }
+    let after = process_start_token(reporter_pid)?;
+    (before == after).then_some(super::pi_reporter::PiReporterIdentity {
+        pid: reporter_pid,
+        start_token: after,
+    })
+}
+
+pub(crate) fn pi_reporter_confirmed_gone(identity: super::pi_reporter::PiReporterIdentity) -> bool {
+    match process_start_token(identity.pid) {
+        Some(current) => current != identity.start_token,
+        None => std::fs::metadata(format!("/proc/{}", identity.pid))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+    }
+}
+
 pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let close = stat.rfind(')')?;

@@ -443,6 +443,17 @@ crate::cli::projection::cli_params! {
     }
 }
 
+/// Negotiated process-verified Pi session report. Legacy methods remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReportAgentSessionVerifiedParams {
+    pub pane_id: String,
+    pub reporter_pid: u32,
+    pub agent_session_path: String,
+    pub seq: u64,
+    #[serde(default)]
+    pub session_start_source: Option<String>,
+}
+
 crate::cli::projection::cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct PaneReportMetadataParams => PaneMetadataProjection {
