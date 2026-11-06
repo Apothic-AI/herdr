@@ -1490,11 +1490,20 @@ impl TerminalState {
         seq: u64,
         reason: Option<String>,
     ) -> Option<TerminalStateMutation> {
+        let previous_reporter = self.verified_pi_reporter();
         let replacement = reason.as_deref() == Some("startup")
             && previous_generation_gone
-            && self
-                .verified_pi_reporter()
-                .is_some_and(|old| old != identity);
+            && previous_reporter.is_some_and(|old| old != identity);
+        let same_reporter_reanchor = matches!(reason.as_deref(), Some("startup" | "reload"))
+            && previous_reporter == Some(identity)
+            && self.current_session_identity_for_persistence().is_some_and(
+                |(source, agent, kind, value)| {
+                    source == "herdr:pi"
+                        && agent == "pi"
+                        && (kind != session_ref.kind || value != session_ref.value)
+                },
+            );
+        let verified_session_reanchor = replacement || same_reporter_reanchor;
         // Sequence counters belong to process generations. Only a verified
         // replacement whose predecessor is confirmed gone can reset ordering.
         if replacement {
@@ -1519,7 +1528,7 @@ impl TerminalState {
             Some(session_ref.clone()),
             Some(seq),
             reason,
-            replacement,
+            verified_session_reanchor,
         )?;
         if self.session_ref_is_current(&session_ref) {
             self.verified_pi_reporter = Some((identity, session_ref));
@@ -1556,7 +1565,7 @@ impl TerminalState {
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         seq: Option<u64>,
         session_start_source: Option<String>,
-        verified_startup_replacement: bool,
+        verified_session_reanchor: bool,
     ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
         let known_agent = crate::detect::parse_agent_label(&agent_label);
@@ -1617,7 +1626,7 @@ impl TerminalState {
         }
         if full_lifecycle_source
             && !selection_can_reconcile
-            && !verified_startup_replacement
+            && !verified_session_reanchor
             && (!process_present || generation_gated || !session_anchored)
         {
             if !Self::session_start_source_is_recognized(session_start_source.as_deref()) {
@@ -1687,7 +1696,7 @@ impl TerminalState {
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
             return None;
         }
-        let session_replacement_allowed = verified_startup_replacement
+        let session_replacement_allowed = verified_session_reanchor
             || Self::session_report_allows_session_replacement(
                 &source,
                 &agent_label,
@@ -3111,10 +3120,11 @@ mod tests {
     #[test]
     fn verified_pi_startup_requires_previous_generation_provenance_and_death() {
         use crate::platform::pi_reporter::PiReporterIdentity;
-        for (has_provenance, gone, expected) in [
-            (false, true, false),
-            (true, false, false),
-            (true, true, true),
+        for (has_provenance, gone, same_identity, expected) in [
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, false, true),
+            (true, false, true, true),
         ] {
             let mut terminal = test_terminal();
             let old =
@@ -3143,11 +3153,19 @@ mod tests {
                     old.clone(),
                 ));
             }
-            let result = terminal.report_verified_pi_session(
+            let new_identity = if same_identity {
+                PiReporterIdentity {
+                    pid: 20,
+                    start_token: 1,
+                }
+            } else {
                 PiReporterIdentity {
                     pid: 30,
                     start_token: 2,
-                },
+                }
+            };
+            let result = terminal.report_verified_pi_session(
+                new_identity,
                 gone,
                 new.clone(),
                 11,
@@ -3157,8 +3175,68 @@ mod tests {
             assert!(terminal.session_ref_is_current(if expected { &new } else { &old }));
             if expected {
                 assert_eq!(terminal.detected_agent, Some(Agent::Pi));
-                assert_eq!(terminal.verified_pi_reporter().unwrap().pid, 30);
+                assert_eq!(terminal.verified_pi_reporter(), Some(new_identity));
             }
+        }
+    }
+
+    #[test]
+    fn verified_pi_startup_or_reload_reanchors_same_reporter_without_resetting_sequence() {
+        use crate::platform::pi_reporter::PiReporterIdentity;
+        for reason in ["startup", "reload"] {
+            let mut terminal = test_terminal();
+            let old =
+                crate::agent_resume::AgentSessionRef::path(test_session_path("same-pid-old.jsonl"))
+                    .unwrap();
+            let new =
+                crate::agent_resume::AgentSessionRef::path(test_session_path("same-pid-new.jsonl"))
+                    .unwrap();
+            let identity = PiReporterIdentity {
+                pid: 20,
+                start_token: 1,
+            };
+            anchor_full_lifecycle_session(&mut terminal, Agent::Pi, "herdr:pi", "pi", old.clone());
+            terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(old),
+                Some(10),
+            );
+            terminal.verified_pi_reporter = Some((
+                identity,
+                crate::agent_resume::AgentSessionRef::path(test_session_path("same-pid-old.jsonl"))
+                    .unwrap(),
+            ));
+
+            let reanchor = terminal.report_verified_pi_session(
+                identity,
+                false,
+                new.clone(),
+                11,
+                Some(reason.into()),
+            );
+
+            assert!(
+                reanchor.is_some(),
+                "{reason} should reanchor the same reporter"
+            );
+            assert!(terminal.session_ref_is_current(&new));
+            assert_eq!(terminal.verified_pi_reporter(), Some(identity));
+            assert_eq!(terminal.hook_report_sequences.get("herdr:pi"), Some(&11));
+            assert!(terminal
+                .set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Idle,
+                    None,
+                    Some(new.clone()),
+                    Some(12),
+                )
+                .is_some());
+            assert_eq!(terminal.state, AgentState::Idle);
+            assert_eq!(terminal.hook_report_sequences.get("herdr:pi"), Some(&12));
         }
     }
 
