@@ -958,6 +958,10 @@ impl TerminalState {
         let process_present = known_agent.is_some()
             && self.detected_agent == known_agent
             && self.recent_agent_process_exit.is_none();
+        // The persisted record is a weaker anchor than a live authority: after a
+        // handoff it can hold a session the authority never claimed. Keep the
+        // live authority authoritative so a lifecycle report can never be
+        // mistaken for a fresh session start and re-arm a process-exit gate.
         let anchored_session_ref = self
             .hook_authority
             .as_ref()
@@ -1001,6 +1005,16 @@ impl TerminalState {
             }
         }
 
+        // Demoting a live full-lifecycle authority into a synthesized
+        // process-exit suppression requires affirmative evidence that the
+        // generation is gone. A reason-less report that merely names an
+        // unrecognized session is not that evidence, and treating it as such
+        // builds a suppression that every subsequent report re-arms.
+        let pinned_by_live_authority = self.hook_authority.as_ref().is_some_and(|authority| {
+            crate::detect::full_lifecycle_hook_authority(&authority.source, &authority.agent_label)
+                && authority.source == source
+                && authority.agent_label == agent_label
+        });
         if process_present
             && session_anchored
             && !self
@@ -1017,6 +1031,19 @@ impl TerminalState {
             };
         }
 
+        // A live authority that already disagrees with this report means the
+        // report is stale, not that the process exited. Synthesizing a
+        // process-exit suppression here would gate every following report and
+        // re-arm on each one, pinning the pane on the stale session forever.
+        // Ordering still advances so a later report is not rejected as old.
+        if pinned_by_live_authority && !session_anchored {
+            if let Some(seq) = seq {
+                if self.hook_report_is_newer(source, Some(seq)) {
+                    self.hook_report_sequences.insert(source.to_string(), seq);
+                }
+            }
+            return FullLifecycleHookReportRoute::Ignore;
+        }
         let Some(session_ref) = session_ref.clone() else {
             return FullLifecycleHookReportRoute::Ignore;
         };
@@ -6818,5 +6845,147 @@ mod tests {
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
         );
+    }
+
+    // Defect 2 regression. A reason-less verified report must never
+    // demote a live full-lifecycle authority into a self-perpetuating
+    // ProcessExit suppression when the pinned session is merely stale.
+    fn seed_stale_full_lifecycle_authority(
+        terminal: &mut TerminalState,
+        stale: &crate::agent_resume::AgentSessionRef,
+    ) {
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        anchor_full_lifecycle_session(terminal, Agent::Pi, "herdr:pi", "pi", stale.clone());
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(stale.clone()),
+                Some(10),
+            )
+            .expect("seed live hook authority");
+    }
+
+    #[test]
+    fn reasonless_verified_report_does_not_arm_suppression_for_stale_authority() {
+        let stale =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("stale-a.jsonl")).unwrap();
+        let current =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("current-c.jsonl"))
+                .unwrap();
+        let mut terminal = test_terminal();
+        seed_stale_full_lifecycle_authority(&mut terminal, &stale);
+        let detected = Agent::Pi;
+
+        let mutation = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            Some(current.clone()),
+            Some(11),
+            None,
+        );
+
+        assert!(mutation.is_none(), "reason-less report must not bind");
+        assert!(
+            !terminal
+                .suppressed_full_lifecycle_hook_reports
+                .contains_key("herdr:pi"),
+            "a live authority must not be demoted into ProcessExit suppression"
+        );
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .and_then(|authority| authority.session_ref.as_ref()),
+            Some(&stale),
+            "pinned authority is unchanged, still fail-closed"
+        );
+        assert!(
+            !terminal.session_ref_is_current(&current),
+            "stale pin must not have been adopted"
+        );
+        assert!(
+            terminal.detected_agent == Some(detected),
+            "detection state untouched"
+        );
+    }
+
+    #[test]
+    fn reasonless_verified_report_does_not_clear_genuine_process_exit_suppression_before_binding() {
+        let stale =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("exit-a.jsonl")).unwrap();
+        let current =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("exit-c.jsonl")).unwrap();
+        let mut terminal = test_terminal();
+        anchor_full_lifecycle_session(&mut terminal, Agent::Pi, "herdr:pi", "pi", stale.clone());
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(stale.clone()),
+                Some(10),
+            )
+            .expect("seed live hook authority");
+        terminal.suppressed_full_lifecycle_hook_reports.insert(
+            "herdr:pi".into(),
+            SuppressedFullLifecycleHookReport {
+                agent_label: "pi".into(),
+                session_ref: Some(stale.clone()),
+                observed_at: Instant::now(),
+                reason: FullLifecycleHookSuppressionReason::ProcessExit,
+                replacement_session_ref: None,
+                pending_replacement_report: None,
+            },
+        );
+
+        let mutation = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            Some(current.clone()),
+            Some(12),
+            None,
+        );
+
+        assert!(
+            mutation.is_none(),
+            "a reason-less report cannot resolve a process-exit gate"
+        );
+        assert!(
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .contains_key("herdr:pi"),
+            "suppression must survive so the gate stays armed"
+        );
+        assert!(!terminal.session_ref_is_current(&current));
+    }
+
+    #[test]
+    fn recognized_reason_still_binds_through_live_authority() {
+        let stale = crate::agent_resume::AgentSessionRef::path(test_session_path("resume-a.jsonl"))
+            .unwrap();
+        let current =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("resume-c.jsonl"))
+                .unwrap();
+        let mut terminal = test_terminal();
+        seed_stale_full_lifecycle_authority(&mut terminal, &stale);
+
+        let mutation = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            Some(current.clone()),
+            Some(13),
+            Some("resume".into()),
+        );
+
+        assert!(mutation.is_some(), "a genuine resume must still bind");
+        assert!(
+            terminal.session_ref_is_current(&current),
+            "resume adopts the new session"
+        );
+        assert!(!terminal.session_ref_is_current(&stale));
     }
 }
