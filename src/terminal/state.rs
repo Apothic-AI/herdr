@@ -33,6 +33,33 @@ pub(crate) struct HandoffAgentState {
     acquisition_pending: bool,
 }
 
+/// Read-only facts for diagnosing a foreground-verified Pi session report.
+/// Not persisted, transferred, or exposed through a client codec/API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PiSessionAcceptanceDiagnostic {
+    pub terminal_id: TerminalId,
+    pub watermark: Option<u64>,
+    pub report_is_newer: bool,
+    pub detected_agent: Option<Agent>,
+    pub process_exit_recorded: bool,
+    pub process_present: bool,
+    pub generation_gated: bool,
+    pub authority_source: Option<String>,
+    pub authority_agent: Option<String>,
+    pub authority_session: Option<crate::agent_resume::AgentSessionRef>,
+    pub persisted_session: Option<crate::agent_resume::PersistedAgentSession>,
+    pub effective_verified_reporter: Option<crate::platform::pi_reporter::PiReporterIdentity>,
+    pub raw_verified_reporter: Option<crate::platform::pi_reporter::PiReporterIdentity>,
+    pub verified_session: Option<crate::agent_resume::AgentSessionRef>,
+    pub suppression: Option<&'static str>,
+    pub suppression_session: Option<crate::agent_resume::AgentSessionRef>,
+    pub replacement_session: Option<crate::agent_resume::AgentSessionRef>,
+    pub incoming_session_is_stale: bool,
+    pub incoming_session_is_current: bool,
+    pub session_anchored: bool,
+    pub owner_conflicts: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SuppressedFullLifecycleHookReport {
     agent_label: String,
@@ -1482,6 +1509,56 @@ impl TerminalState {
         }
     }
 
+    pub(crate) fn pi_session_acceptance_diagnostic(
+        &self,
+        incoming: &crate::agent_resume::AgentSessionRef,
+        seq: u64,
+    ) -> PiSessionAcceptanceDiagnostic {
+        let authority = self.hook_authority.as_ref();
+        let suppressed = self.suppressed_full_lifecycle_hook_reports.get("herdr:pi");
+        PiSessionAcceptanceDiagnostic {
+            terminal_id: self.id.clone(),
+            watermark: self.hook_report_sequences.get("herdr:pi").copied(),
+            report_is_newer: self.hook_report_is_newer("herdr:pi", Some(seq)),
+            detected_agent: self.detected_agent,
+            process_exit_recorded: self.recent_agent_process_exit.is_some(),
+            process_present: self.detected_agent == Some(Agent::Pi)
+                && self.recent_agent_process_exit.is_none(),
+            generation_gated: suppressed.is_some_and(|s| {
+                s.agent_label == "pi" && s.reason != FullLifecycleHookSuppressionReason::HookClear
+            }),
+            authority_source: authority.map(|a| a.source.clone()),
+            authority_agent: authority.map(|a| a.agent_label.clone()),
+            authority_session: authority.and_then(|a| a.session_ref.clone()),
+            persisted_session: self.persisted_agent_session.clone(),
+            effective_verified_reporter: self.verified_pi_reporter(),
+            raw_verified_reporter: self
+                .verified_pi_reporter
+                .as_ref()
+                .map(|(identity, _)| *identity),
+            verified_session: self
+                .verified_pi_reporter
+                .as_ref()
+                .map(|(_, session)| session.clone()),
+            suppression: suppressed.map(|s| match s.reason {
+                FullLifecycleHookSuppressionReason::HookClear => "hook_clear",
+                FullLifecycleHookSuppressionReason::ProcessExit => "process_exit",
+            }),
+            suppression_session: suppressed.and_then(|s| s.session_ref.clone()),
+            replacement_session: suppressed.and_then(|s| s.replacement_session_ref.clone()),
+            incoming_session_is_stale: self.full_lifecycle_hook_report_matches_stale_session(
+                "herdr:pi",
+                "pi",
+                &Some(incoming.clone()),
+            ),
+            incoming_session_is_current: self.session_ref_is_current(incoming),
+            session_anchored: authority.is_some_and(|a| {
+                a.source == "herdr:pi" && a.agent_label == "pi" && a.session_ref.is_some()
+            }) || self.persisted_agent_session_matches("herdr:pi", "pi"),
+            owner_conflicts: self.current_session_owner_conflicts("herdr:pi", "pi"),
+        }
+    }
+
     pub(crate) fn report_verified_pi_session(
         &mut self,
         identity: crate::platform::pi_reporter::PiReporterIdentity,
@@ -1512,6 +1589,13 @@ impl TerminalState {
                 .remove("herdr:pi");
         }
         if !self.hook_report_is_newer("herdr:pi", Some(seq)) {
+            self.trace_pi_session_route(
+                "sequence_not_newer",
+                "herdr:pi",
+                "pi",
+                Some(seq),
+                reason.as_deref(),
+            );
             return None;
         }
         let reason = if reason.is_none() && self.hook_authority.is_none() {
@@ -1556,6 +1640,20 @@ impl TerminalState {
             session_start_source,
             false,
         )
+    }
+
+    fn trace_pi_session_route(
+        &self,
+        route: &'static str,
+        source: &str,
+        agent: &str,
+        seq: Option<u64>,
+        reason: Option<&str>,
+    ) {
+        if (source, agent) == ("herdr:pi", "pi") {
+            tracing::info!(event = "pi.session.route", terminal_id = ?self.id,
+                route, seq, reason, "Pi session report routing decision");
+        }
     }
 
     fn set_agent_session_ref_for_session_start_inner(
@@ -1630,6 +1728,13 @@ impl TerminalState {
             && (!process_present || generation_gated || !session_anchored)
         {
             if !Self::session_start_source_is_recognized(session_start_source.as_deref()) {
+                self.trace_pi_session_route(
+                    "gated_reason_not_recognized",
+                    &source,
+                    &agent_label,
+                    seq,
+                    session_start_source.as_deref(),
+                );
                 return None;
             }
             let seq = seq?;
@@ -1638,9 +1743,23 @@ impl TerminalState {
                 .get(&source)
                 .is_some_and(|previous| seq <= *previous)
             {
+                self.trace_pi_session_route(
+                    "gated_sequence_not_newer",
+                    &source,
+                    &agent_label,
+                    Some(seq),
+                    session_start_source.as_deref(),
+                );
                 return None;
             }
 
+            self.trace_pi_session_route(
+                "generation_or_acquisition_gate",
+                &source,
+                &agent_label,
+                Some(seq),
+                session_start_source.as_deref(),
+            );
             let previous_agent_label = self.effective_agent_label().map(str::to_string);
             let previous_known_agent = self.effective_known_agent();
             let previous_state = self.state;
@@ -1691,9 +1810,23 @@ impl TerminalState {
             return None;
         }
         if !unsequenced_selection && !self.accept_hook_report(&source, seq) {
+            self.trace_pi_session_route(
+                "sequence_not_newer",
+                &source,
+                &agent_label,
+                seq,
+                session_start_source.as_deref(),
+            );
             return None;
         }
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
+            self.trace_pi_session_route(
+                "detected_agent_conflict",
+                &source,
+                &agent_label,
+                seq,
+                session_start_source.as_deref(),
+            );
             return None;
         }
         let session_replacement_allowed = verified_session_reanchor
@@ -1726,6 +1859,13 @@ impl TerminalState {
                 session_start_source.as_deref(),
             );
         if owner_conflicts && !foreground_takeover_allowed {
+            self.trace_pi_session_route(
+                "owner_conflict",
+                &source,
+                &agent_label,
+                seq,
+                session_start_source.as_deref(),
+            );
             return None;
         }
         if self
@@ -1737,6 +1877,13 @@ impl TerminalState {
             )
             .is_some()
         {
+            self.trace_pi_session_route(
+                "same_owner_id_conflict",
+                &source,
+                &agent_label,
+                seq,
+                session_start_source.as_deref(),
+            );
             return None;
         }
         let replaced_hook_session = self.same_owner_full_lifecycle_hook_authority_session_ref(
@@ -1745,8 +1892,22 @@ impl TerminalState {
             &session_ref,
         );
         if replaced_hook_session.is_some() && !session_replacement_allowed {
+            self.trace_pi_session_route(
+                "session_replacement_not_allowed",
+                &source,
+                &agent_label,
+                seq,
+                session_start_source.as_deref(),
+            );
             return None;
         }
+        self.trace_pi_session_route(
+            "session_binding_applied",
+            &source,
+            &agent_label,
+            seq,
+            session_start_source.as_deref(),
+        );
 
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
@@ -2997,6 +3158,150 @@ mod tests {
                 Some(&background_ref)
             );
         }
+    }
+
+    #[test]
+    fn pi_acceptance_diagnostic_is_read_only_and_preserves_rejection_behavior() {
+        use crate::platform::pi_reporter::PiReporterIdentity;
+        let identity = PiReporterIdentity {
+            pid: 20,
+            start_token: 1,
+        };
+        let old = crate::agent_resume::AgentSessionRef::path(test_session_path("diag-old.jsonl"))
+            .unwrap();
+        let incoming =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("diag-new.jsonl"))
+                .unwrap();
+        let mut terminal = test_terminal();
+        anchor_full_lifecycle_session(&mut terminal, Agent::Pi, "herdr:pi", "pi", old.clone());
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(old.clone()),
+                Some(100),
+            )
+            .expect("seed live hook authority");
+        let before = terminal.pi_session_acceptance_diagnostic(&incoming, 100);
+        assert_eq!(before.watermark, Some(100));
+        assert!(!before.report_is_newer);
+        assert!(before.process_present);
+        assert!(before.session_anchored);
+        assert!(!before.owner_conflicts);
+        assert_eq!(before.authority_session, Some(old.clone()));
+        // Reading the diagnostic cannot change sequence, authority or gates.
+        assert_eq!(
+            terminal.pi_session_acceptance_diagnostic(&incoming, 100),
+            before
+        );
+        assert!(terminal
+            .report_verified_pi_session(
+                identity,
+                false,
+                incoming.clone(),
+                100,
+                Some("resume".into())
+            )
+            .is_none());
+        assert_eq!(
+            terminal.pi_session_acceptance_diagnostic(&incoming, 100),
+            before
+        );
+        // Newer reload is still rejected; diagnostics must not grant replacement.
+        assert!(terminal
+            .report_verified_pi_session(
+                identity,
+                false,
+                incoming.clone(),
+                101,
+                Some("reload".into())
+            )
+            .is_none());
+        assert!(terminal.session_ref_is_current(&old));
+        // A genuine newer resume retains the baseline's successful behavior.
+        assert!(terminal
+            .report_verified_pi_session(
+                identity,
+                false,
+                incoming.clone(),
+                102,
+                Some("resume".into())
+            )
+            .is_some());
+        assert!(terminal.session_ref_is_current(&incoming));
+        let after = terminal.pi_session_acceptance_diagnostic(&old, 103);
+        assert!(after.incoming_session_is_stale);
+        assert_eq!(after.effective_verified_reporter, Some(identity));
+        assert_eq!(after.raw_verified_reporter, Some(identity));
+        assert_eq!(after.verified_session, Some(incoming));
+    }
+
+    #[test]
+    fn pi_acceptance_diagnostic_identifies_owner_and_generation_gates_without_mutating_them() {
+        let incoming =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("diag-gate.jsonl"))
+                .unwrap();
+        let mut terminal = test_terminal();
+        anchor_full_lifecycle_session(&mut terminal, Agent::Pi, "herdr:pi", "pi", incoming.clone());
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(incoming.clone()),
+                Some(100),
+            )
+            .expect("seed live hook authority");
+        terminal.suppressed_full_lifecycle_hook_reports.insert(
+            "herdr:pi".into(),
+            SuppressedFullLifecycleHookReport {
+                agent_label: "pi".into(),
+                session_ref: Some(incoming.clone()),
+                observed_at: Instant::now(),
+                reason: FullLifecycleHookSuppressionReason::ProcessExit,
+                replacement_session_ref: None,
+                pending_replacement_report: None,
+            },
+        );
+        let before = terminal.pi_session_acceptance_diagnostic(&incoming, 101);
+        assert!(before.generation_gated);
+        assert_eq!(before.suppression, Some("process_exit"));
+        assert_eq!(
+            terminal.pi_session_acceptance_diagnostic(&incoming, 101),
+            before
+        );
+        terminal.hook_authority.as_mut().unwrap().source = "custom:other".into();
+        let owner = terminal.pi_session_acceptance_diagnostic(&incoming, 101);
+        assert!(owner.owner_conflicts);
+        assert_eq!(owner.authority_source.as_deref(), Some("custom:other"));
+    }
+
+    #[test]
+    fn pi_acceptance_diagnostic_separates_raw_and_effective_provenance() {
+        use crate::platform::pi_reporter::PiReporterIdentity;
+        let old = crate::agent_resume::AgentSessionRef::path(test_session_path(
+            "diag-provenance-old.jsonl",
+        ))
+        .unwrap();
+        let unrelated = crate::agent_resume::AgentSessionRef::path(test_session_path(
+            "diag-provenance-other.jsonl",
+        ))
+        .unwrap();
+        let identity = PiReporterIdentity {
+            pid: 20,
+            start_token: 1,
+        };
+        let mut terminal = test_terminal();
+        anchor_full_lifecycle_session(&mut terminal, Agent::Pi, "herdr:pi", "pi", old.clone());
+        terminal.verified_pi_reporter = Some((identity, unrelated.clone()));
+        let facts = terminal.pi_session_acceptance_diagnostic(&old, 1);
+        assert_eq!(facts.effective_verified_reporter, None);
+        assert_eq!(facts.raw_verified_reporter, Some(identity));
+        assert_eq!(facts.verified_session, Some(unrelated));
+        assert_eq!(terminal.verified_pi_reporter(), None);
     }
 
     #[test]

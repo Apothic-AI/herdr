@@ -1604,10 +1604,16 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let identity = self
+        let shell_pid = self
             .lookup_runtime(ws_idx, pane_id)
-            .and_then(|(runtime, _)| runtime.child_pid())
+            .and_then(|(runtime, _)| runtime.child_pid());
+        let identity = shell_pid
             .and_then(|shell| crate::platform::pi_reporter::verify(shell, params.reporter_pid));
+        tracing::info!(event = "pi.session.endpoint", request_id = %id,
+            requested_pane = %params.pane_id, resolved_pane = ?pane_id,
+            shell_pid, reporter_pid = params.reporter_pid, ?identity,
+            seq = params.seq, reason = ?params.session_start_source,
+            "Pi verified report endpoint ownership result");
         let Some(identity) = identity else {
             return encode_error(
                 id,
@@ -1628,6 +1634,11 @@ impl App {
             .pane_terminal(ws_idx, pane_id)
             .and_then(|terminal| terminal.verified_pi_reporter())
             .is_some_and(crate::platform::pi_reporter::confirmed_gone);
+        let before = tracing::enabled!(tracing::Level::INFO).then(|| {
+            self.pane_terminal(ws_idx, pane_id)
+                .map(|terminal| terminal.pi_session_acceptance_diagnostic(&session_ref, params.seq))
+        });
+        let reason = params.session_start_source.clone();
         self.handle_internal_event(crate::events::AppEvent::VerifiedPiSessionReported {
             pane_id,
             identity,
@@ -1640,6 +1651,17 @@ impl App {
             && self
                 .pane_terminal(ws_idx, pane_id)
                 .is_some_and(|terminal| terminal.session_ref_is_current(&session_ref));
+        if let Some(before) = before {
+            let after = self.pane_terminal(ws_idx, pane_id).map(|terminal| {
+                terminal.pi_session_acceptance_diagnostic(&session_ref, params.seq)
+            });
+            tracing::info!(event = "pi.session.endpoint_acceptance", request_id = %id,
+                requested_pane = %params.pane_id, resolved_pane = ?pane_id,
+                shell_pid, ?identity, seq = params.seq, reason = ?reason,
+                incoming_session = ?session_ref, previous_generation_gone,
+                ?before, ?after, applied,
+                "Pi verified report acceptance before and after mutation");
+        }
         if applied {
             encode_success(id, ResponseResult::Ok {})
         } else {
