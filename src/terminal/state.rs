@@ -1238,12 +1238,16 @@ impl TerminalState {
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
                 source: source.clone(),
-                agent: agent_label,
+                agent: agent_label.clone(),
                 session_ref,
             });
             if let Some(pending) = pending {
                 self.hook_report_sequences.insert(source, pending.seq);
                 self.hook_authority = Some(pending.authority);
+            } else if self.hook_authority.as_ref().is_some_and(|authority| {
+                authority.source == source && authority.agent_label == agent_label
+            }) {
+                self.hook_authority = None;
             }
         }
     }
