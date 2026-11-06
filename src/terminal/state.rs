@@ -1265,12 +1265,16 @@ impl TerminalState {
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
                 source: source.clone(),
-                agent: agent_label,
+                agent: agent_label.clone(),
                 session_ref,
             });
             if let Some(pending) = pending {
                 self.hook_report_sequences.insert(source, pending.seq);
                 self.hook_authority = Some(pending.authority);
+            } else if self.hook_authority.as_ref().is_some_and(|authority| {
+                authority.source == source && authority.agent_label == agent_label
+            }) {
+                self.hook_authority = None;
             }
         }
     }
@@ -3277,6 +3281,185 @@ mod tests {
         let owner = terminal.pi_session_acceptance_diagnostic(&incoming, 101);
         assert!(owner.owner_conflicts);
         assert_eq!(owner.authority_source.as_deref(), Some("custom:other"));
+    }
+
+    #[test]
+    fn pi_gated_new_with_process_present_clears_stale_matching_authority_and_adopts_persisted_session(
+    ) {
+        let old =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("gated-stale-a.jsonl"))
+                .unwrap();
+        let new =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("gated-new-c.jsonl"))
+                .unwrap();
+        let mut terminal = test_terminal();
+        anchor_full_lifecycle_session(&mut terminal, Agent::Pi, "herdr:pi", "pi", old.clone());
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(old.clone()),
+                Some(10),
+            )
+            .expect("seed live hook authority");
+        terminal.suppressed_full_lifecycle_hook_reports.insert(
+            "herdr:pi".into(),
+            SuppressedFullLifecycleHookReport {
+                agent_label: "pi".into(),
+                session_ref: Some(old.clone()),
+                observed_at: Instant::now(),
+                reason: FullLifecycleHookSuppressionReason::ProcessExit,
+                replacement_session_ref: None,
+                pending_replacement_report: None,
+            },
+        );
+
+        let before = terminal.pi_session_acceptance_diagnostic(&new, 11);
+        assert!(before.generation_gated);
+        assert_eq!(before.suppression, Some("process_exit"));
+        assert_eq!(before.authority_session, Some(old.clone()));
+
+        // Process present: detected agent is Pi and no recent exit
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert!(terminal.recent_agent_process_exit.is_none());
+
+        // Gated reason=new with pending=None
+        let mutation = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            Some(new.clone()),
+            Some(11),
+            Some("new".into()),
+        );
+        assert!(mutation.is_some(), "gated new should return a mutation");
+
+        // Stale matching hook_authority is cleared, persisted session adopted
+        assert!(
+            terminal.hook_authority.is_none(),
+            "stale matching hook authority should be cleared"
+        );
+        assert!(
+            terminal.session_ref_is_current(&new),
+            "new session should be current for persistence"
+        );
+
+        let after = terminal.pi_session_acceptance_diagnostic(&new, 12);
+        assert!(
+            !after.generation_gated,
+            "generation_gated should now be false"
+        );
+        assert_eq!(after.suppression, None);
+        assert_eq!(
+            after.persisted_session.as_ref().map(|s| &s.session_ref),
+            Some(&new)
+        );
+
+        // Next reason-less / recognized report can bind
+        let bound = terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            Some(new.clone()),
+            Some(12),
+        );
+        assert!(bound.is_some(), "subsequent hook report should bind");
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .and_then(|a| a.session_ref.as_ref()),
+            Some(&new)
+        );
+    }
+
+    #[test]
+    fn pi_gated_clearing_preserves_unrelated_authority() {
+        let pi_session =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("pi-session.jsonl"))
+                .unwrap();
+        let codex_session =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("codex-session.jsonl"))
+                .unwrap();
+        let mut terminal = test_terminal();
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:codex".into(),
+                "codex".into(),
+                AgentState::Working,
+                None,
+                Some(codex_session.clone()),
+                Some(10),
+            )
+            .expect("seed codex authority");
+
+        terminal.suppressed_full_lifecycle_hook_reports.insert(
+            "herdr:pi".into(),
+            SuppressedFullLifecycleHookReport {
+                agent_label: "pi".into(),
+                session_ref: Some(pi_session.clone()),
+                observed_at: Instant::now(),
+                reason: FullLifecycleHookSuppressionReason::ProcessExit,
+                replacement_session_ref: Some(pi_session.clone()),
+                pending_replacement_report: None,
+            },
+        );
+
+        terminal.clear_full_lifecycle_hook_suppression_for_detected_agent(None, Some(Agent::Pi));
+
+        // The codex hook_authority should NOT be cleared
+        assert!(terminal.hook_authority.is_some());
+        let auth = terminal.hook_authority.as_ref().unwrap();
+        assert_eq!(auth.source, "herdr:codex");
+        assert_eq!(auth.agent_label, "codex");
+        assert_eq!(auth.session_ref, Some(codex_session));
+    }
+
+    #[test]
+    fn pi_gated_clearing_with_pending_replacement_installs_authority_and_sequence() {
+        let new_session =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("pending-new.jsonl"))
+                .unwrap();
+        let mut terminal = test_terminal();
+        let pending_auth = HookAuthority {
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            state: AgentState::Idle,
+            message: None,
+            reported_at: Instant::now(),
+            session_ref: Some(new_session.clone()),
+        };
+
+        terminal.suppressed_full_lifecycle_hook_reports.insert(
+            "herdr:pi".into(),
+            SuppressedFullLifecycleHookReport {
+                agent_label: "pi".into(),
+                session_ref: None,
+                observed_at: Instant::now(),
+                reason: FullLifecycleHookSuppressionReason::ProcessExit,
+                replacement_session_ref: Some(new_session.clone()),
+                pending_replacement_report: Some(PendingFullLifecycleHookReport {
+                    authority: pending_auth.clone(),
+                    seq: 15,
+                }),
+            },
+        );
+
+        terminal.clear_full_lifecycle_hook_suppression_for_detected_agent(None, Some(Agent::Pi));
+
+        assert_eq!(
+            terminal.hook_authority.as_ref(),
+            Some(&pending_auth),
+            "pending authority should be installed"
+        );
+        assert_eq!(
+            terminal.hook_report_sequences.get("herdr:pi"),
+            Some(&15),
+            "pending sequence should be installed"
+        );
     }
 
     #[test]
