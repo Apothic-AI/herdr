@@ -350,27 +350,48 @@ fn capture_tab(
             })
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
-        let agent_session = terminal.and_then(|terminal| {
-            if let Some(authority) = terminal.hook_authority.as_ref() {
-                if let Some(session_ref) = authority.session_ref.as_ref() {
-                    return Some(PaneAgentSessionSnapshot {
-                        source: authority.source.clone(),
-                        agent: authority.agent_label.clone(),
-                        kind: session_ref.kind,
-                        value: session_ref.value.clone(),
-                    });
+        // A handoff must not let a live authority overwrite the persisted
+        // record with a session it no longer agrees with. When the two
+        // disagree the authority is the stale side: it was carried across
+        // from a predecessor generation that never saw the newer session,
+        // whereas the persisted record was produced by the session-acceptance
+        // path. Serializing the authority first therefore re-armed the very
+        // stale pin the acceptance path had just replaced, and every restart
+        // undid the recovery.
+        let agent_session =
+            terminal.and_then(|terminal| {
+                let from_authority = terminal.hook_authority.as_ref().and_then(|authority| {
+                    authority
+                        .session_ref
+                        .as_ref()
+                        .map(|session_ref| PaneAgentSessionSnapshot {
+                            source: authority.source.clone(),
+                            agent: authority.agent_label.clone(),
+                            kind: session_ref.kind,
+                            value: session_ref.value.clone(),
+                        })
+                });
+                let from_persisted = terminal.persisted_agent_session.as_ref().map(|session| {
+                    PaneAgentSessionSnapshot {
+                        source: session.source.clone(),
+                        agent: session.agent.clone(),
+                        kind: session.session_ref.kind,
+                        value: session.session_ref.value.clone(),
+                    }
+                });
+                match (from_authority, from_persisted) {
+                    (Some(authority), Some(persisted))
+                        if authority.source == persisted.source
+                            && authority.agent == persisted.agent
+                            && (authority.kind != persisted.kind
+                                || authority.value != persisted.value) =>
+                    {
+                        Some(persisted)
+                    }
+                    (Some(authority), _) => Some(authority),
+                    (None, persisted) => persisted,
                 }
-            }
-            terminal
-                .persisted_agent_session
-                .as_ref()
-                .map(|session| PaneAgentSessionSnapshot {
-                    source: session.source.clone(),
-                    agent: session.agent.clone(),
-                    kind: session.session_ref.kind,
-                    value: session.session_ref.value.clone(),
-                })
-        });
+            });
         let agent_resume = terminal
             .and_then(|terminal| terminal.reported_resume())
             .map(|resume| PaneAgentResumeSnapshot {
@@ -1303,6 +1324,49 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Path
         );
         assert_eq!(agent_session.value, session_path);
+    }
+
+    #[test]
+    fn capture_prefers_persisted_session_over_disagreeing_hook_authority() {
+        let mut state = state_with_workspaces(&["one"]);
+        let stale_path = test_session_path("stale-authority.jsonl");
+        let current_path = test_session_path("current-session.jsonl");
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Working,
+        );
+        // Acceptance already recorded the newer session as persisted truth.
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(current_path.clone()).unwrap(),
+        });
+        // The authority still names the session it was handed off with.
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            crate::detect::AgentState::Working,
+            None,
+            crate::agent_resume::AgentSessionRef::path(stale_path.clone()),
+            Some(20),
+        );
+
+        let snapshot = capture_from_state(&state);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("agent session should be captured");
+
+        assert_eq!(
+            agent_session.value, current_path,
+            "handoff must not resurrect the stale authority over the accepted session"
+        );
     }
 
     #[test]
